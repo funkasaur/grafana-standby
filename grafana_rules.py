@@ -92,6 +92,7 @@ def _group_path(folder_uid, group):
 def apply(grafana, rules, *, folder_uid, group, interval_s=60, prune=False, log=print):
     """Create or update `rules` (all in one folder + group), then set the group interval.
 
+    Each API write takes effect independently. A failure can leave earlier rule writes applied.
     Returns the uids that the group update removed (only possible with prune=True)."""
     if not rules:
         raise GrafanaError("no rules given")

@@ -16,6 +16,7 @@ import urllib.request
 
 
 UTC = dt.timezone.utc
+PROVISIONING = "/api/v1/provisioning"
 
 
 class APIError(Exception):
@@ -101,7 +102,19 @@ def request(base, token, timeout, method, path, body=None):
 
 
 def rule_path(uid):
-    return "/api/v1/provisioning/alert-rules/" + urllib.parse.quote(uid, safe="")
+    return resource_path("alert-rules", uid)
+
+
+def resource_path(resource, name):
+    return f"{PROVISIONING}/{resource}/" + urllib.parse.quote(name, safe="")
+
+
+def rule_group_path(folder_uid, group):
+    return resource_path("folder", folder_uid) + "/rule-groups/" + urllib.parse.quote(group, safe="")
+
+
+def folder_of(rule):
+    return rule.get("folderUID", rule.get("folderUid"))
 
 
 def rules(client):
@@ -112,7 +125,7 @@ def rules(client):
 
 
 def outside_rules(client, folder_uid):
-    return [rule for rule in rules(client) if rule.get("folderUID", rule.get("folderUid")) != folder_uid]
+    return [rule for rule in rules(client) if folder_of(rule) != folder_uid]
 
 
 def rule_paused(rule):
@@ -241,6 +254,45 @@ def state_save(config, state, dry_run):
         atomic_write(config["state_path"], json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
+def remember_created(config, state, key, name, dry_run):
+    if not dry_run:
+        state[key] = sorted(set(state.get(key, ())) | {name})
+        state_save(config, state, dry_run)
+
+
+def prune_managed(config, state, standby, key, destination, source, resource, dry_run):
+    for name in sorted(set(state.get(key, ())) - source):
+        if name in destination:
+            standby.write("DELETE", resource_path(resource, name))
+        if not dry_run:
+            state[key].remove(name)
+            state_save(config, state, dry_run)
+
+
+def copy_rule(config, state, standby, rule, existing, dry_run):
+    body = dict(comparable(rule), isPaused=True)
+    if existing is None:
+        standby.write("POST", f"{PROVISIONING}/alert-rules", body)
+        remember_created(config, state, "managed_rule_uids", rule["uid"], dry_run)
+    elif comparable(existing) != body:
+        standby.write("PUT", rule_path(rule["uid"]), body)
+
+
+def sync_group_intervals(standby, intervals, dry_run):
+    for path, interval in intervals.items():
+        try:
+            group = standby.get(path)
+        except APIError as exc:
+            if not dry_run or "HTTP 404" not in str(exc):
+                raise
+            group = {"rules": []}
+        if not isinstance(group.get("rules"), list):
+            raise APIError(f"unexpected rule group response for {path}")
+        if group.get("interval") != interval:
+            # The PUT replaces the group. Carry forward every current member, including standby-local rules.
+            standby.write("PUT", path, dict(group, interval=interval))
+
+
 def metrics(config, state, standby, dry_run):
     count = sum(not rule_paused(rule) for rule in outside_rules(standby, config["standby_folder_uid"]))
     values = {
@@ -255,7 +307,11 @@ def metrics(config, state, standby, dry_run):
     if dry_run:
         print("DRY RUN: write textfile metrics")
     else:
-        atomic_write(config["textfile_path"], content, 0o644)
+        path = config["textfile_path"]
+        try:
+            atomic_write(path, content, 0o644)
+        except OSError as exc:
+            raise APIError(f"cannot write node-exporter textfile {path}: {exc.strerror or exc}") from exc
 
 
 def activate(config, state, primary, standby, dry_run, failures=None):
@@ -308,20 +364,21 @@ def check(config, state, primary, standby, dry_run):
                 state["primary_paused_uids"] = [r["uid"] for r in source_rules if rule_paused(r)]
                 source_folders = {f["uid"]: f for f in primary.get("/api/folders?limit=1000")}
                 dest_folders = {f["uid"] for f in standby.get("/api/folders?limit=1000")}
-                dest_rules = {r["uid"]: r for r in outside_rules(standby, config["standby_folder_uid"])}
+                dest_rules = {r["uid"]: r for r in rules(standby)}
                 # Copy rules only in standby mode: during a failover (primary healthy again but not yet for
                 # recover_threshold checks) writing paused copies would silence the standby early.
                 for rule in (source_rules if state.get("mode", "standby") == "standby" else []):
-                    folder_uid = rule.get("folderUID", rule.get("folderUid"))
-                    if folder_uid == config["standby_folder_uid"]:
+                    folder_uid = folder_of(rule)
+                    existing = dest_rules.get(rule["uid"])
+                    if config["standby_folder_uid"] in (folder_uid, folder_of(existing or {})):
                         continue
-                    body = dict(rule, isPaused=True)
-                    if rule["uid"] not in dest_rules or comparable(dest_rules[rule["uid"]]) != comparable(body):
-                        if folder_uid and folder_uid not in dest_folders:
-                            folder = source_folders[folder_uid]
-                            standby.write("POST", "/api/folders", {"uid": folder_uid, "title": folder["title"]})
-                            dest_folders.add(folder_uid)
-                        put_rule(standby, rule, True)
+                    if existing is not None and comparable(existing) == dict(comparable(rule), isPaused=True):
+                        continue
+                    if folder_uid and folder_uid not in dest_folders:
+                        folder = source_folders[folder_uid]
+                        standby.write("POST", "/api/folders", {"uid": folder_uid, "title": folder["title"]})
+                        dest_folders.add(folder_uid)
+                    copy_rule(config, state, standby, rule, existing, dry_run)
                 state["paused_refresh_ts"] = state["last_check_ts"]
             except (APIError, KeyError, TypeError, ValueError) as exc:
                 print(f"Primary paused-rule and copy refresh failed: {exc}", file=sys.stderr)
@@ -354,7 +411,13 @@ def sync(config, state, primary, standby, dry_run):
     if not all(isinstance(x, list) for x in (folders, templates, mutes, search)):
         raise APIError("unexpected primary list response")
     dest_folders = {x["uid"]: x for x in standby.get("/api/folders?limit=1000")}
-    dest_rules = {x["uid"]: x for x in outside_rules(standby, config["standby_folder_uid"])}
+    local_folder = config["standby_folder_uid"]
+    all_dest_rules = rules(standby)
+    dest_rules = {x["uid"]: x for x in all_dest_rules if folder_of(x) != local_folder}
+    protected_uids = {x["uid"] for x in all_dest_rules if folder_of(x) == local_folder}
+    copied_rules = [r for r in source_rules if folder_of(r) != local_folder and r["uid"] not in protected_uids]
+    group_paths = {rule_group_path(folder_of(r), r["ruleGroup"]) for r in copied_rules}
+    intervals = {path: primary.get(path)["interval"] for path in sorted(group_paths)}
     dest_templates = {x["name"]: x for x in standby.get("/api/v1/provisioning/templates")}
     dest_mutes = {x["name"]: x for x in standby.get("/api/v1/provisioning/mute-timings")}
     dest_contacts = {x["name"] for x in standby.get("/api/v1/provisioning/contact-points")}
@@ -370,16 +433,12 @@ def sync(config, state, primary, standby, dry_run):
                 standby.write("PUT", "/api/folders/" + urllib.parse.quote(uid, safe=""), {"title": folder["title"]})
         else:
             standby.write("POST", "/api/folders", {"uid": uid, "title": folder["title"]})
-    source_uids = set()
-    for rule in source_rules:
-        if rule.get("folderUID", rule.get("folderUid")) == config["standby_folder_uid"]:
-            continue
-        source_uids.add(rule["uid"])
-        body = dict(rule, isPaused=True)
-        if rule["uid"] not in dest_rules or comparable(dest_rules[rule["uid"]]) != comparable(body):
-            put_rule(standby, rule, True)
-    for uid in dest_rules.keys() - source_uids:
-        standby.write("DELETE", rule_path(uid))
+    for rule in copied_rules:
+        copy_rule(config, state, standby, rule, dest_rules.get(rule["uid"]), dry_run)
+    prune_managed(config, state, standby, "managed_rule_uids", dest_rules,
+                  {rule["uid"] for rule in source_rules}, "alert-rules", dry_run)
+    sync_group_intervals(standby, intervals, dry_run)
+
     def receivers(node):
         found = {node["receiver"]} if node.get("receiver") else set()
         for route in node.get("routes", []):
@@ -387,24 +446,28 @@ def sync(config, state, primary, standby, dry_run):
         return found
 
     missing_receivers = receivers(policies) - dest_contacts
+    for template in templates:
+        name = template["name"]
+        if dest_templates.get(name) != template:
+            standby.write("PUT", resource_path("templates", name), template)
+            if name not in dest_templates:
+                remember_created(config, state, "managed_template_names", name, dry_run)
+    for mute in mutes:
+        name = mute["name"]
+        if name not in dest_mutes:
+            standby.write("POST", "/api/v1/provisioning/mute-timings", mute)
+            remember_created(config, state, "managed_mute_timing_names", name, dry_run)
+        elif dest_mutes[name] != mute:
+            standby.write("PUT", resource_path("mute-timings", name), mute)
     if missing_receivers:
         print("Missing standby policy receivers: " + ", ".join(sorted(missing_receivers)), file=sys.stderr)
     else:
+        # The new policy tree can reference newly copied timings. Remove old timings after replacing it.
         standby.write("PUT", "/api/v1/provisioning/policies", policies)
-    for template in templates:
-        name = urllib.parse.quote(template["name"], safe="")
-        if dest_templates.get(template["name"]) != template:
-            standby.write("PUT", "/api/v1/provisioning/templates/" + name, template)
-    for name in dest_templates.keys() - {x["name"] for x in templates}:
-        standby.write("DELETE", "/api/v1/provisioning/templates/" + urllib.parse.quote(name, safe=""))
-    for mute in mutes:
-        name = urllib.parse.quote(mute["name"], safe="")
-        if mute["name"] not in dest_mutes:
-            standby.write("POST", "/api/v1/provisioning/mute-timings", mute)
-        elif dest_mutes[mute["name"]] != mute:
-            standby.write("PUT", "/api/v1/provisioning/mute-timings/" + name, mute)
-    for name in dest_mutes.keys() - {x["name"] for x in mutes}:
-        standby.write("DELETE", "/api/v1/provisioning/mute-timings/" + urllib.parse.quote(name, safe=""))
+        prune_managed(config, state, standby, "managed_mute_timing_names", dest_mutes,
+                      {x["name"] for x in mutes}, "mute-timings", dry_run)
+    prune_managed(config, state, standby, "managed_template_names", dest_templates,
+                  {x["name"] for x in templates}, "templates", dry_run)
     for item in dashboards:
         dashboard = dict(item["dashboard"])
         uid = dashboard["uid"]
@@ -465,19 +528,19 @@ def locked(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="/etc/grafana-standby/config.json")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="preview changes without writing to Grafana or disk")
     parser.add_argument("command", choices=("check", "sync", "activate", "deactivate", "status"))
     args = parser.parse_args(argv)
     try:
         with open(args.config, encoding="utf-8") as source:
             config = json.load(source)
         for name, default in (("state_path", "/var/lib/grafana-standby/state.json"),
-                              ("textfile_path", "/var/lib/node_exporter/textfile_collector/grafana_standby.prom"),
+                              ("textfile_path", "/var/lib/prometheus/node-exporter/grafana_standby.prom"),
                               ("fail_threshold", 3), ("recover_threshold", 5),
                               ("eval_max_age_s", 300), ("paused_refresh_s", 900), ("http_timeout_s", 10),
                               ("primary_name", "primary Grafana"), ("standby_name", "standby Grafana")):
             config.setdefault(name, default)
-        with locked(config["state_path"]):
+        with contextlib.nullcontext() if args.dry_run else locked(config["state_path"]):
             state = state_load(config["state_path"])
             primary = Primary(config)
             standby = Standby(config, args.dry_run)

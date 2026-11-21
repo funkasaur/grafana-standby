@@ -23,11 +23,12 @@ tool keeps the standby quiet until it's needed.
   in a row the standby **activates**: every copied rule that is active on the primary is un-paused (rules paused
   on the primary stay paused). After `recover_threshold` healthy checks it **pauses** them again. While the primary
   is healthy, `check` also copies new and changed rules (paused) every `paused_refresh_s`.
-- **`sync`** (nightly timer): copies folders, alert rules (paused), notification policies, templates, mute timings
+- **`sync`** (nightly timer): copies folders, alert rules (paused), evaluation intervals, notification policies, templates, mute timings
   and dashboards from the primary. It never copies contact points or datasources: create those on the standby
   yourself (same names, so the copied policy tree finds its receivers; sync stops before replacing the policy
-  tree if a receiver is missing). Copied rules and dashboards that disappear from the primary are deleted on the
-  standby; dashboards you made on the standby yourself are left alone.
+  tree if a receiver is missing). Sync deletes removed primary rules, templates, and mute timings only when the
+  state file records that this tool created them on the standby. Keep the state file across upgrades. Objects
+  that predate this tracking are kept until removed manually. Dashboards retain their existing UID-based tracking.
 - **The primary is only ever read.** The primary client has no write method.
 - **One standby folder is never touched**: put rules that should always run on the standby (for example "the
   primary is down", "the standby's own Prometheus is down") in it and give its uid as `standby_folder_uid`.
@@ -71,7 +72,7 @@ Config (`/etc/grafana-standby/config.json`, mode 600; see [`examples/config.exam
 | `eval_max_age_s` | `300` | how old a rule's last evaluation may be |
 | `paused_refresh_s` | `900` | how often `check` refreshes the rule copies while healthy |
 | `state_path` | `/var/lib/grafana-standby/state.json` | state file |
-| `textfile_path` | `/var/lib/node_exporter/textfile_collector/grafana_standby.prom` | metrics for node-exporter |
+| `textfile_path` | `/var/lib/prometheus/node-exporter/grafana_standby.prom` | metrics for node-exporter |
 | `http_timeout_s` | `10` | per request |
 
 Operate:
@@ -83,6 +84,10 @@ sudo grafana_standby.py activate      # force failover (test it once after setup
 sudo grafana_standby.py deactivate    # force failback
 journalctl -u grafana-standby-check.service -u grafana-standby-sync.service
 ```
+
+`--dry-run sync` reads both Grafanas and prints the planned writes without changing Grafana, state, or metrics.
+Group interval updates retain current group members. A standby-local rule that shares a copied group will use
+that group's interval, so give it a separate group if it needs its own cadence.
 
 ## Alert rules as code (`grafana_rules.py`)
 
@@ -104,6 +109,8 @@ overwrites UI edits).
 > rule-group endpoint, which replaces the group: any rule in it that your file doesn't list is **deleted**.
 > `grafana_rules.py` reads the group first and stops with an error if it holds rules you didn't list. Pass
 > `--prune` (or `prune=True`) only when you really want those deleted. Keep hand-made rules in their own group.
+> Rule writes and the final group write are separate API calls. If a call fails, earlier writes remain
+> applied, and the group can still have its old interval. Correct the error and rerun the same rules file.
 
 ## Tests
 

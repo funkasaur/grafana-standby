@@ -2,6 +2,7 @@ import contextlib
 import copy
 import datetime as dt
 import http.server
+import io
 import json
 import tempfile
 import threading
@@ -13,7 +14,7 @@ import grafana_standby as app  # noqa: E402
 
 
 def rule(uid, folder="main", paused=False):
-    return {"uid": uid, "folderUID": folder, "title": uid, "isPaused": paused,
+    return {"uid": uid, "folderUID": folder, "ruleGroup": "group", "title": uid, "isPaused": paused,
             "condition": "A", "data": [{"refId": "A"}]}
 
 
@@ -100,6 +101,7 @@ class Fake:
         self.health = {"database": "ok"}
         self.evaluation = dt.datetime.now(dt.timezone.utc).isoformat()
         self.groups = None
+        self.intervals = {}
         self.rules = []
         self.folders = []
         self.policies = {"receiver": "telegram"}
@@ -131,6 +133,13 @@ class Fake:
                     return self.respond(200, {"data": {"groups": groups}})
                 if path == "/api/v1/provisioning/alert-rules":
                     return self.respond(200, fake.rules)
+                if path.startswith("/api/v1/provisioning/folder/"):
+                    _, folder, _, group = path.rsplit("/", 3)
+                    members = [r for r in fake.rules if (r["folderUID"], r["ruleGroup"]) == (folder, group)]
+                    if not members:
+                        return self.respond(404)
+                    return self.respond(200, {"title": group, "folderUid": folder,
+                                              "interval": fake.intervals.get((folder, group), 60), "rules": members})
                 if path == "/api/folders":
                     return self.respond(200, fake.folders)
                 if path == "/api/v1/provisioning/policies":
@@ -162,6 +171,23 @@ class Fake:
                         fake.rules.append(body)
                 elif path == "/api/v1/provisioning/alert-rules" and self.command == "POST":
                     fake.rules.append(body)
+                elif path.startswith("/api/v1/provisioning/folder/"):
+                    _, folder, _, group = path.rsplit("/", 3)
+                    fake.intervals[(folder, group)] = body["interval"]
+                    fake.rules = [r for r in fake.rules if (r["folderUID"], r["ruleGroup"]) != (folder, group)]
+                    fake.rules.extend(body["rules"])
+                elif path.startswith("/api/v1/provisioning/templates/"):
+                    name = path.rsplit("/", 1)[1]
+                    fake.templates = [r for r in fake.templates if r["name"] != name]
+                    if self.command == "PUT":
+                        fake.templates.append(body)
+                elif path == "/api/v1/provisioning/mute-timings" and self.command == "POST":
+                    fake.mutes.append(body)
+                elif path.startswith("/api/v1/provisioning/mute-timings/"):
+                    name = path.rsplit("/", 1)[1]
+                    fake.mutes = [r for r in fake.mutes if r["name"] != name]
+                    if self.command == "PUT":
+                        fake.mutes.append(body)
                 elif path == "/api/folders" and self.command == "POST":
                     fake.folders.append(body)
                 elif path.startswith("/api/folders/") and self.command == "PUT":
@@ -384,7 +410,7 @@ class StandbyTest(unittest.TestCase):
         self.standby.rules = [rule("a", paused=True), rule("old", paused=True), rule("always", "standby")]
         self.primary.dashboards = {"dash": {"dashboard": {"uid": "dash", "id": 3, "title": "Dash"}, "meta": {"folderUid": "main"}}}
         self.run_cmd("sync")
-        self.assertEqual({r["uid"] for r in self.standby.rules}, {"a", "new", "always"})
+        self.assertEqual({r["uid"] for r in self.standby.rules}, {"a", "new", "old", "always"})
         self.assertEqual(self.state()["primary_paused_uids"], ["new"])
         self.assertTrue(self.state()["last_sync_success_ts"])
         self.assertTrue(all(w[3] == "true" for w in self.standby.writes))
@@ -393,6 +419,44 @@ class StandbyTest(unittest.TestCase):
         self.state_path.write_text(json.dumps({"mode": "active"}))
         self.run_cmd("sync")
         self.assertEqual(len(self.standby.writes), previous)
+
+    def test_sync_prunes_only_objects_it_created_and_preserves_local_group_members(self):
+        self.primary.intervals[("main", "group")] = 180
+        self.primary.templates = [{"name": "copied"}, {"name": "shared", "template": "new"}]
+        self.standby.templates = [{"name": "local"}, {"name": "shared", "template": "old"}]
+        self.primary.mutes = [{"name": "copied"}, {"name": "shared", "time_intervals": []}]
+        self.standby.mutes = [{"name": "local"}, {"name": "shared"}]
+        self.primary.rules.append(rule("copied"))
+        self.standby.rules.append(rule("local"))
+        self.run_cmd("sync")
+        self.assertEqual(self.standby.intervals[("main", "group")], 180)
+        self.assertEqual(self.state()["managed_rule_uids"], ["copied"])
+        self.assertEqual(self.state()["managed_template_names"], ["copied"])
+        self.assertEqual(self.state()["managed_mute_timing_names"], ["copied"])
+        self.primary.rules.clear()
+        self.primary.templates.clear()
+        self.primary.mutes.clear()
+        previous_state = self.state_path.read_bytes()
+        self.standby.writes.clear()
+        self.run_cmd("sync", dry=True)
+        self.assertEqual(self.state_path.read_bytes(), previous_state)
+        self.assertEqual(self.standby.writes, [])
+        self.run_cmd("sync")
+        self.assertEqual({r["uid"] for r in self.standby.rules}, {"a", "b", "always", "local"})
+        self.assertEqual({r["name"] for r in self.standby.templates}, {"local", "shared"})
+        self.assertEqual({r["name"] for r in self.standby.mutes}, {"local", "shared"})
+
+    def test_sync_dry_run_does_not_create_a_lock(self):
+        self.primary.rules.append(rule("new", "new-folder"))
+        self.run_cmd("sync", dry=True)
+        self.assertFalse(self.state_path.with_suffix(".json.lock").exists())
+        self.assertEqual(self.standby.writes, [])
+
+    def test_textfile_failure_names_the_path(self):
+        self.metrics_path.mkdir()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.run_cmd("check", expected=1)
+        self.assertIn(f"cannot write node-exporter textfile {self.metrics_path}", errors.getvalue())
 
     def test_primary_get_only_across_commands(self):
         self.primary.folders = [{"uid": "main", "title": "Main"}]
