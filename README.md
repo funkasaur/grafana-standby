@@ -1,4 +1,28 @@
-# grafana-standby
+<h1 align="center">grafana-standby</h1>
+
+<p align="center">Fail over Grafana-managed alerting to a warm standby.</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/funkasaur/grafana-standby"></a>
+  <a href="https://github.com/funkasaur/grafana-standby/commits/"><img alt="Last commit" src="https://img.shields.io/github/last-commit/funkasaur/grafana-standby"></a>
+</p>
+
+<p align="center">
+  <img alt="Cluster nodes" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/cluster_nodes.json">
+  <img alt="VMs running" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/vms_running.json">
+  <img alt="Containers running" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/containers_running.json">
+  <img alt="Uptime days" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/uptime_days.json">
+  <img alt="Alerts firing" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/alerts_firing.json">
+  <img alt="GPUs" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/funkasaur/proxmox-mini-pc-cluster/badges/gpus.json">
+</p>
+
+## Overview
+
+The standby keeps alerting available if the primary Grafana stops evaluating rules.
+
+Python 3.10+, standard library only.
+
+## Features
 
 Two small tools for people whose alerting lives in Grafana (Grafana-managed alert rules, no Alertmanager):
 
@@ -7,7 +31,16 @@ Two small tools for people whose alerting lives in Grafana (Grafana-managed aler
   them again once the primary is back.
 - **`grafana_rules.py`**: alert rules as code. Define rules in a Python file, apply them idempotently by uid.
 
-Python 3.10+, standard library only.
+## Repository structure
+
+```text
+grafana-standby/
+├── grafana_standby.py  # Standby sync and failover
+├── grafana_rules.py    # Alert rules as code
+├── systemd/            # Check and sync units
+├── examples/           # Configuration and rule examples
+└── tests/              # Offline unit tests
+```
 
 ## Why
 
