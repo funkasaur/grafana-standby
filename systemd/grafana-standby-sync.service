@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync primary Grafana configuration to standby
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/grafana_standby.py sync
+ProtectSystem=strict
+ReadWritePaths=/var/lib/grafana-standby /var/lib/prometheus/node-exporter
+NoNewPrivileges=true
+

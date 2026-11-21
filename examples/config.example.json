@@ -1,0 +1,20 @@
+{
+  "primary_url": "http://grafana-primary.example:3000",
+  "primary_token": "PRIMARY_READ_ONLY_SERVICE_ACCOUNT_TOKEN",
+  "standby_url": "http://localhost:3000",
+  "standby_token": "STANDBY_SERVICE_ACCOUNT_TOKEN",
+  "standby_folder_uid": "STANDBY_ALWAYS_ON_FOLDER_UID",
+  "primary_name": "primary Grafana",
+  "standby_name": "standby Grafana",
+  "webhook_url": "",
+  "webhook_field": "text",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "fail_threshold": 3,
+  "recover_threshold": 5,
+  "eval_max_age_s": 300,
+  "paused_refresh_s": 900,
+  "state_path": "/var/lib/grafana-standby/state.json",
+  "textfile_path": "/var/lib/prometheus/node-exporter/grafana_standby.prom",
+  "http_timeout_s": 10
+}

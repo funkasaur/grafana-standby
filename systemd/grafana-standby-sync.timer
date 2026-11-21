@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync standby Grafana nightly
+
+[Timer]
+OnCalendar=*-*-* 04:15
+Persistent=true
+Unit=grafana-standby-sync.service
+
+[Install]
+WantedBy=timers.target
+

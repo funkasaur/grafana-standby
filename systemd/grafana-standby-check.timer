@@ -1,0 +1,11 @@
+[Unit]
+Description=Check primary Grafana every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=grafana-standby-check.service
+
+[Install]
+WantedBy=timers.target
+
